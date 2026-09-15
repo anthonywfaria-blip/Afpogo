@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+
 import json
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from config import (
     EXCLUDE_TYPES,
@@ -35,16 +37,15 @@ def parse_dt(value):
 
     s = value.strip()
 
-    # Explicit UTC timestamp
+    # UTC timestamp
     if s.endswith("Z"):
         dt = datetime.fromisoformat(s[:-1] + "+00:00")
         return dt.astimezone(LOCAL_TZ)
 
-    # Timestamp with an explicit timezone
-    dt = datetime.fromisoformat(s)
+    # Timestamp with or without timezone
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-    # Timestamp without timezone:
-    # treat it as Eastern local time.
+    # Unsuffixed timestamps are treated as Eastern local time
     if dt.tzinfo is None:
         return dt.replace(tzinfo=LOCAL_TZ)
 
@@ -62,66 +63,71 @@ def ics_escape(value):
     )
 
 
-def excluded(event):
-    event_type = str(event.get("eventType") or "").strip().lower()
-    event_id = str(event.get("eventID") or "").strip()
+def fold_ics_line(line, limit=75):
+    if len(line) <= limit:
+        return [line]
 
-    name = str(event.get("name") or "")
-    heading = str(event.get("heading") or "")
+    out = []
 
-    # ---------------------------------------------------------
-    # 1. Optional whitelist
-    # ---------------------------------------------------------
+    while len(line) > limit:
+        out.append(line[:limit])
+        line = " " + line[limit:]
+
+    out.append(line)
+    return out
+
+
+def get_exclusion_reason(event):
+    """
+    Returns the reason an event should be excluded,
+    or None if the event should be included.
+    """
+
+    etype = (event.get("eventType") or "").strip().lower()
+    eid = str(event.get("eventID") or "").strip()
+    name = (event.get("name") or "").strip()
+    heading = (event.get("heading") or "").strip()
+
+    # Optional whitelist
     include_types = {
         str(x).strip().lower()
         for x in INCLUDE_TYPES
         if str(x).strip()
     }
 
-    if include_types and event_type not in include_types:
-        return True
+    if include_types and etype not in include_types:
+        return f"TYPE not in INCLUDE_TYPES: {etype or '[blank]'}"
 
-    # ---------------------------------------------------------
-    # 2. Exclude entire event types
-    # ---------------------------------------------------------
+    # Exclude event type
     exclude_types = {
         str(x).strip().lower()
         for x in EXCLUDE_TYPES
         if str(x).strip()
     }
 
-    if event_type in exclude_types:
-        return True
+    if etype in exclude_types:
+        return f"TYPE: {etype}"
 
-    # ---------------------------------------------------------
-    # 3. Exclude specific event IDs
-    # ---------------------------------------------------------
+    # Exclude specific event ID
     exclude_ids = {
         str(x).strip()
         for x in EXCLUDE_EVENT_IDS
         if str(x).strip()
     }
 
-    if event_id in exclude_ids:
-        return True
+    if eid and eid in exclude_ids:
+        return f"EVENT ID: {eid}"
 
-    # ---------------------------------------------------------
-    # 4. Exclude events based on title text
-    # ---------------------------------------------------------
-    exclude_titles = [
-        str(x).strip().lower()
-        for x in EXCLUDE_TITLES
-        if str(x).strip()
-    ]
-
-    # Match title/name and heading.
+    # Exclude title text
     title_text = f"{name} {heading}".lower()
 
-    for phrase in exclude_titles:
-        if phrase in title_text:
-            return True
+    for fragment in EXCLUDE_TITLES:
+        fragment = str(fragment).strip()
 
-    return False
+        if fragment and fragment.lower() in title_text:
+            return f"TITLE contains: {fragment}"
+
+    return None
 
 
 def build_ics(events):
@@ -138,27 +144,40 @@ def build_ics(events):
     ]
 
     included = 0
-    excluded_count = 0
+    excluded = 0
+    missing_dates = 0
+
+    exclusion_reasons = Counter()
+    excluded_events = []
 
     for event in events:
 
-        if excluded(event):
-            excluded_count += 1
+        name = event.get("name") or "Pokémon GO Event"
+        etype = event.get("eventType") or "[blank]"
+        eid = event.get("eventID") or "[no ID]"
+
+        reason = get_exclusion_reason(event)
+
+        if reason:
+            excluded += 1
+            exclusion_reasons[reason] += 1
+            excluded_events.append(
+                {
+                    "name": name,
+                    "type": etype,
+                    "id": eid,
+                    "reason": reason,
+                }
+            )
             continue
 
         start = parse_dt(event.get("start"))
         end = parse_dt(event.get("end"))
 
         if not start or not end:
+            missing_dates += 1
             continue
 
-        event_id = (
-            event.get("eventID")
-            or event.get("name")
-            or f"event-{included}"
-        )
-
-        name = event.get("name") or "Pokémon GO Event"
         heading = event.get("heading") or ""
         link = event.get("link") or ""
 
@@ -171,10 +190,12 @@ def build_ics(events):
                 else link
             )
 
+        uid = eid if eid != "[no ID]" else name
+
         lines.extend(
             [
                 "BEGIN:VEVENT",
-                f"UID:{ics_escape(event_id)}@anthony-pogo-calendar",
+                f"UID:{ics_escape(uid)}@anthony-pogo-calendar",
                 f"DTSTAMP:{now}",
                 (
                     f"DTSTART;TZID={TIMEZONE}:"
@@ -202,17 +223,99 @@ def build_ics(events):
 
     lines.append("END:VCALENDAR")
 
+    ics = "\r\n".join(lines) + "\r\n"
+
     return (
-        "\r\n".join(lines) + "\r\n",
+        ics,
         included,
-        excluded_count,
+        excluded,
+        missing_dates,
+        exclusion_reasons,
+        excluded_events,
     )
 
 
+def print_report(
+    total,
+    included,
+    excluded,
+    missing_dates,
+    exclusion_reasons,
+    excluded_events,
+):
+    print("")
+    print("=" * 70)
+    print("POKÉMON GO CALENDAR FILTER REPORT")
+    print("=" * 70)
+
+    print(f"Events fetched:          {total}")
+    print(f"Events included:         {included}")
+    print(f"Events excluded:         {excluded}")
+    print(f"Events missing dates:    {missing_dates}")
+
+    print("-" * 70)
+    print("EXCLUSION SUMMARY")
+    print("-" * 70)
+
+    if not exclusion_reasons:
+        print("No events were excluded.")
+
+    else:
+        for reason, count in sorted(
+            exclusion_reasons.items(),
+            key=lambda x: (-x[1], x[0]),
+        ):
+            print(f"{count:4}  {reason}")
+
+    print("-" * 70)
+    print("EXCLUDED EVENTS")
+    print("-" * 70)
+
+    if not excluded_events:
+        print("No excluded events.")
+
+    else:
+        for event in excluded_events:
+            print(
+                f"[{event['reason']}] "
+                f"{event['name']} "
+                f"(type={event['type']}, id={event['id']})"
+            )
+
+    print("=" * 70)
+    print("")
+
+
 def main():
+    print("Fetching Pokémon GO events...")
+    print(f"Source: {SOURCE_URL}")
+    print(f"Timezone: {TIMEZONE}")
+
     events = fetch_json()
 
-    ics, included, excluded_count = build_ics(events)
+    # ScrapedDuck normally returns a list.
+    # This also handles a dictionary containing an events list.
+    if isinstance(events, dict):
+        if isinstance(events.get("events"), list):
+            events = events["events"]
+        else:
+            raise ValueError(
+                "Unexpected JSON format: could not find event list."
+            )
+
+    if not isinstance(events, list):
+        raise ValueError("Unexpected JSON format: expected a list of events.")
+
+    print(f"Fetched {len(events)} events.")
+
+    (
+        ics,
+        included,
+        excluded,
+        missing_dates,
+        exclusion_reasons,
+        excluded_events,
+    ) = build_ics(events)
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
 
@@ -222,6 +325,7 @@ def main():
         newline="",
     )
 
+    # Create a simple landing page.
     html = f"""<!doctype html>
 <html>
 <head>
@@ -230,15 +334,9 @@ def main():
 </head>
 <body>
 <h1>{CALENDAR_NAME}</h1>
-<p>
-Filtered auto-updating calendar.
-</p>
-<p>
-Events included: {included}
-</p>
-<p>
-Events excluded by filters: {excluded_count}
-</p>
+<p>Filtered auto-updating calendar.</p>
+<p>Generated events: {included}</p>
+<p>Excluded events: {excluded}</p>
 <p>
 <a href="pokemon-go.ics">
 Subscribe/download the ICS feed
@@ -253,9 +351,16 @@ Subscribe/download the ICS feed
         encoding="utf-8",
     )
 
-    print(f"Generated {OUT}")
-    print(f"Events included: {included}")
-    print(f"Events excluded: {excluded_count}")
+    print_report(
+        len(events),
+        included,
+        excluded,
+        missing_dates,
+        exclusion_reasons,
+        excluded_events,
+    )
+
+    print(f"Generated {OUT} with {included} events.")
 
 
 if __name__ == "__main__":
