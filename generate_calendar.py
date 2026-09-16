@@ -189,13 +189,6 @@ def build_ics(events):
 
         description = heading
 
-        if link:
-            description = (
-                f"{heading}\\n{link}"
-                if heading
-                else link
-            )
-
         uid = eid if eid != "[no ID]" else name
 
         lines.extend(
