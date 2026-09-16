@@ -12,6 +12,8 @@ from config import (
     EXCLUDE_EVENT_IDS,
     EXCLUDE_TITLES,
     INCLUDE_TYPES,
+    EVENT_TYPE_SYMBOLS,
+    DEFAULT_EVENT_SYMBOL,
     TIMEZONE,
     CALENDAR_NAME,
     SOURCE_URL,
@@ -37,15 +39,12 @@ def parse_dt(value):
 
     s = value.strip()
 
-    # UTC timestamp
     if s.endswith("Z"):
         dt = datetime.fromisoformat(s[:-1] + "+00:00")
         return dt.astimezone(LOCAL_TZ)
 
-    # Timestamp with or without timezone
     dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-    # Unsuffixed timestamps are treated as Eastern local time
     if dt.tzinfo is None:
         return dt.replace(tzinfo=LOCAL_TZ)
 
@@ -63,18 +62,18 @@ def ics_escape(value):
     )
 
 
-def fold_ics_line(line, limit=75):
-    if len(line) <= limit:
-        return [line]
+def get_event_symbol(event_type):
+    """
+    Return the configured symbol for an event type.
+    Falls back to DEFAULT_EVENT_SYMBOL for new/unrecognized types.
+    """
 
-    out = []
+    event_type = (event_type or "").strip().lower()
 
-    while len(line) > limit:
-        out.append(line[:limit])
-        line = " " + line[limit:]
-
-    out.append(line)
-    return out
+    return EVENT_TYPE_SYMBOLS.get(
+        event_type,
+        DEFAULT_EVENT_SYMBOL,
+    )
 
 
 def get_exclusion_reason(event):
@@ -88,7 +87,6 @@ def get_exclusion_reason(event):
     name = (event.get("name") or "").strip()
     heading = (event.get("heading") or "").strip()
 
-    # Optional whitelist
     include_types = {
         str(x).strip().lower()
         for x in INCLUDE_TYPES
@@ -98,7 +96,6 @@ def get_exclusion_reason(event):
     if include_types and etype not in include_types:
         return f"TYPE not in INCLUDE_TYPES: {etype or '[blank]'}"
 
-    # Exclude event type
     exclude_types = {
         str(x).strip().lower()
         for x in EXCLUDE_TYPES
@@ -108,7 +105,6 @@ def get_exclusion_reason(event):
     if etype in exclude_types:
         return f"TYPE: {etype}"
 
-    # Exclude specific event ID
     exclude_ids = {
         str(x).strip()
         for x in EXCLUDE_EVENT_IDS
@@ -118,7 +114,6 @@ def get_exclusion_reason(event):
     if eid and eid in exclude_ids:
         return f"EVENT ID: {eid}"
 
-    # Exclude title text
     title_text = f"{name} {heading}".lower()
 
     for fragment in EXCLUDE_TITLES:
@@ -160,15 +155,21 @@ def build_ics(events):
 
         if reason:
             excluded += 1
+
             exclusion_reasons[reason] += 1
+
+            symbol = get_event_symbol(etype)
+
             excluded_events.append(
                 {
                     "name": name,
                     "type": etype,
                     "id": eid,
                     "reason": reason,
+                    "symbol": symbol,
                 }
             )
+
             continue
 
         start = parse_dt(event.get("start"))
@@ -180,6 +181,11 @@ def build_ics(events):
 
         heading = event.get("heading") or ""
         link = event.get("link") or ""
+
+        symbol = get_event_symbol(etype)
+
+        # Add the symbol to the beginning of the calendar title.
+        calendar_name = f"{symbol} {name}"
 
         description = heading
 
@@ -205,7 +211,7 @@ def build_ics(events):
                     f"DTEND;TZID={TIMEZONE}:"
                     f"{end.strftime('%Y%m%dT%H%M%S')}"
                 ),
-                f"SUMMARY:{ics_escape(name)}",
+                f"SUMMARY:{ics_escape(calendar_name)}",
                 f"DESCRIPTION:{ics_escape(description)}",
             ]
         )
@@ -213,11 +219,7 @@ def build_ics(events):
         if link:
             lines.append(f"URL:{link}")
 
-        lines.extend(
-            [
-                "END:VEVENT",
-            ]
-        )
+        lines.append("END:VEVENT")
 
         included += 1
 
@@ -277,10 +279,20 @@ def print_report(
     else:
         for event in excluded_events:
             print(
+                f"{event['symbol']} "
                 f"[{event['reason']}] "
                 f"{event['name']} "
                 f"(type={event['type']}, id={event['id']})"
             )
+
+    print("-" * 70)
+    print("EVENT TYPE SYMBOLS")
+    print("-" * 70)
+
+    for event_type, symbol in sorted(
+        EVENT_TYPE_SYMBOLS.items()
+    ):
+        print(f"{symbol}  {event_type}")
 
     print("=" * 70)
     print("")
@@ -293,8 +305,6 @@ def main():
 
     events = fetch_json()
 
-    # ScrapedDuck normally returns a list.
-    # This also handles a dictionary containing an events list.
     if isinstance(events, dict):
         if isinstance(events.get("events"), list):
             events = events["events"]
@@ -304,7 +314,9 @@ def main():
             )
 
     if not isinstance(events, list):
-        raise ValueError("Unexpected JSON format: expected a list of events.")
+        raise ValueError(
+            "Unexpected JSON format: expected a list of events."
+        )
 
     print(f"Fetched {len(events)} events.")
 
@@ -325,7 +337,6 @@ def main():
         newline="",
     )
 
-    # Create a simple landing page.
     html = f"""<!doctype html>
 <html>
 <head>
@@ -360,7 +371,9 @@ Subscribe/download the ICS feed
         excluded_events,
     )
 
-    print(f"Generated {OUT} with {included} events.")
+    print(
+        f"Generated {OUT} with {included} events."
+    )
 
 
 if __name__ == "__main__":
